@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # <-- Import the middleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -16,70 +17,76 @@ if not GOOGLE_API_KEY:
 # Configure Gemini AI with the API key
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Create FastAPI instance
-app = FastAPI(title="Roadmap Generator API", version="1.0.0")
+# Initialize FastAPI app
+app = FastAPI(title="EDITH Chatbot API", version="1.0.0")
 
-# Add CORS middleware to allow requests from your frontend
+# Enable CORS to allow frontend to interact with the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this to ['http://localhost:5173'] for production
+    allow_origins=["*"],  # In production, restrict to your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic model for the request payload
-class RoadmapRequest(BaseModel):
-    project_title: str
-    project_description: str
-    start_date: str  # You can also use datetime.date if preferred
-    duration_months: int
-    additional_notes: str = ""
+# Data models for the conversation
+class ChatMessage(BaseModel):
+    role: str  # "user" or "bot"
+    message: str
 
-# Pydantic model for the response
-class RoadmapResponse(BaseModel):
-    roadmap: str
+class ChatRequest(BaseModel):
+    user_message: str
+    history: Optional[List[ChatMessage]] = []
 
-def generate_roadmap(title: str, description: str, start: str, duration: int, notes: str) -> str:
+class ChatResponse(BaseModel):
+    bot_message: str
+    history: List[ChatMessage]
+
+def generate_humorous_response(prompt: str) -> str:
     """
-    Uses Gemini AI to generate a detailed roadmap for the provided project details.
+    Uses Gemini AI to generate a humorous response in the persona of EDITH (in a Tony Stark style).
     """
-    prompt = f"""
-    You are a seasoned project management expert and strategic planner.
-    Generate a very detailed roadmap for a project with the following details:
-
-    Project Title: {title}
-    Project Description: {description}
-    Start Date: {start}
-    Estimated Duration: {duration} months
-    Additional Notes: {notes}
-
-    Your roadmap should include:
-    - A clear timeline with phases or milestones
-    - Specific tasks and objectives for each phase
-    - Key performance indicators and checkpoints
-    - Suggested resources and risk mitigation strategies
-    - Final deliverables and review points
-
-    Please ensure the roadmap is comprehensive, practical, and actionable for project managers and teams.
-    """
+    # Construct a prompt with instructions for humor and wit
+    full_prompt = (
+        "You are EDITH, an AI chatbot with the wit and sarcasm of Tony Stark. "
+        "Your tone is humorous, lighthearted, and occasionally cheeky, but always insightful. "
+        "Answer the user's query with clever remarks and a touch of irony. \n" +
+        prompt
+    )
     model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content([prompt])
-    return response.text
+    response = model.generate_content([full_prompt])
+    return response.text.strip()
 
-@app.post("/roadmap", response_model=RoadmapResponse)
-def roadmap_endpoint(request: RoadmapRequest):
-    if not request.project_title or not request.project_description:
-        raise HTTPException(status_code=400, detail="Project title and description are required.")
-    
-    try:
-        roadmap_text = generate_roadmap(
-            title=request.project_title,
-            description=request.project_description,
-            start=request.start_date,
-            duration=request.duration_months,
-            notes=request.additional_notes
-        )
-        return RoadmapResponse(roadmap=roadmap_text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/chat", response_model=ChatResponse)
+def chat_endpoint(chat_request: ChatRequest):
+    # Get the conversation history or initialize an empty list
+    history = chat_request.history or []
+
+    # Append the new user message to the history
+    history.append(ChatMessage(role="user", message=chat_request.user_message))
+
+    # Limit history to the last 100 messages
+    if len(history) > 100:
+        history = history[-100:]
+
+    # Build a conversation prompt with a system instruction
+    conversation_prompt = (
+        "System: You are EDITH, an educational, professional, interactive, and witty chatbot with a Tony Stark flair. "
+        "Respond humorously, provide insightful answers, and always add a clever remark. \n"
+    )
+    for chat in history:
+        if chat.role == "user":
+            conversation_prompt += "User: " + chat.message + "\n"
+        else:
+            conversation_prompt += "EDITH: " + chat.message + "\n"
+    conversation_prompt += "EDITH: "  # Prompt for the next answer
+
+    # Get the bot's response from Gemini AI
+    bot_message = generate_humorous_response(conversation_prompt)
+
+    # Append the bot response to the conversation history
+    history.append(ChatMessage(role="bot", message=bot_message))
+
+    # Return the bot's response along with the updated history
+    return ChatResponse(bot_message=bot_message, history=history)
+
