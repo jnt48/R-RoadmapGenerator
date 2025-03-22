@@ -1,92 +1,178 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import os
-import google.generativeai as genai
 from dotenv import load_dotenv
+import google.generativeai as genai
+from youtube_transcript_api import YouTubeTranscriptApi
+import os
+import re
+import json
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Retrieve the Google API Key from environment variables
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise Exception("GOOGLE_API_KEY is not set in your environment variables.")
-
-# Configure Gemini AI with the API key
-genai.configure(api_key=GOOGLE_API_KEY)
-
 # Initialize FastAPI app
-app = FastAPI(title="EDITH Chatbot API", version="1.0.0")
+app = FastAPI()
 
-# Enable CORS to allow frontend to interact with the backend
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend domain
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Data models for the conversation
-class ChatMessage(BaseModel):
-    role: str  # "user" or "bot"
-    message: str
+# Configure Gemini API
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    print("Warning: GOOGLE_API_KEY not found in environment variables")
+else:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
-class ChatRequest(BaseModel):
-    user_message: str
-    history: Optional[List[ChatMessage]] = []
+# Pydantic Model
+class VideoURL(BaseModel):
+    url: str
+    language: str = "en"  # Default language is English
 
-class ChatResponse(BaseModel):
-    bot_message: str
-    history: List[ChatMessage]
+# Function to extract YouTube Video ID
+def extract_video_id(youtube_url):
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", youtube_url)
+    if match:
+        return match.group(1)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid YouTube URL. Please provide a valid video link."
+        )
 
-def generate_humorous_response(prompt: str) -> str:
+# Function to fetch transcript text
+def fetch_transcript(video_id, language):
+    try:
+        return YouTubeTranscriptApi.get_transcript(video_id, languages=[language])
+    except Exception:
+        return None
+
+def extract_transcript_text(youtube_video_url, language="en"):
+    video_id = extract_video_id(youtube_video_url)
+    transcript = fetch_transcript(video_id, language)
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Transcript extraction failed.")
+    return " ".join([entry["text"] for entry in transcript])
+
+# Function to generate summary using Gemini AI
+def generate_summary(transcript_text, target_language):
+    prompt = f"""
+    You are a YouTube video summarizer. Summarize the given transcript into key points 
+    with full explanation in more than 500 words using Markdown format. Include emojis for readability. 
+
+    If the transcript is not in English, translate it to English first before summarizing.
+
+    Transcript:
+    {transcript_text}
     """
-    Uses Gemini AI to generate a humorous response in the persona of EDITH (in a Tony Stark style).
-    """
-    # Construct a prompt with instructions for humor and wit
-    full_prompt = (
-        "You are EDITH, an AI chatbot with the wit and sarcasm of Tony Stark. "
-        "Your tone is humorous, lighthearted, and occasionally cheeky, but always insightful. "
-        "Answer the user's query with clever remarks and a touch of irony. \n" +
-        prompt
-    )
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content([full_prompt])
-    return response.text.strip()
 
-@app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(chat_request: ChatRequest):
-    # Get the conversation history or initialize an empty list
-    history = chat_request.history or []
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
-    # Append the new user message to the history
-    history.append(ChatMessage(role="user", message=chat_request.user_message))
+        response = model.generate_content(prompt)
 
-    # Limit history to the last 100 messages
-    if len(history) > 100:
-        history = history[-100:]
-
-    # Build a conversation prompt with a system instruction
-    conversation_prompt = (
-        "System: You are EDITH, an educational, professional, interactive, and witty chatbot with a Tony Stark flair. "
-        "Respond humorously, provide insightful answers, and always add a clever remark. \n"
-    )
-    for chat in history:
-        if chat.role == "user":
-            conversation_prompt += "User: " + chat.message + "\n"
+        print("🔹 Raw Gemini Response:", response)
+        if hasattr(response, 'text'):
+            return response.text
+        elif isinstance(response, dict):
+            return response.get("candidates", [{}])[0].get("content", "Summary generation failed.")
         else:
-            conversation_prompt += "EDITH: " + chat.message + "\n"
-    conversation_prompt += "EDITH: "  # Prompt for the next answer
+            return "Unexpected response format from Gemini API."
+    except Exception as e:
+        print("❌ Gemini API Error:", str(e))
+        raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
 
-    # Get the bot's response from Gemini AI
-    bot_message = generate_humorous_response(conversation_prompt)
+@app.post("/api/summarize")
+async def summarize_video(video: VideoURL):
+    try:
+        print(f"📌 Received URL: {video.url}, Language: {video.language}")
 
-    # Append the bot response to the conversation history
-    history.append(ChatMessage(role="bot", message=bot_message))
+        transcript = extract_transcript_text(video.url, video.language)
+        if not transcript:
+            raise HTTPException(status_code=400, detail="Transcript extraction failed.")
 
-    # Return the bot's response along with the updated history
-    return ChatResponse(bot_message=bot_message, history=history)
+        summary = generate_summary(transcript, target_language=video.language)
+        print("📌 Generated Summary:", summary[:500])
 
+        return {
+            "summary": summary,
+            "questions": [
+                "What are the main points discussed in the video?",
+                "How does this content relate to the broader context?",
+                "What evidence is presented to support the main arguments?"
+            ]
+        }
+    except HTTPException as e:
+        print("❌ API Error:", str(e))
+        raise e
+    except Exception as e:
+        print("❌ Unexpected Error:", str(e))
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+# Generate 5 MCQs with detailed prompt
+@app.post("/api/generate-mcqs")
+async def generate_mcqs(video: VideoURL):
+    try:
+        transcript = extract_transcript_text(video.url, video.language)
+        if not transcript:
+            raise HTTPException(status_code=400, detail="Transcript extraction failed.")
+
+        prompt = f"""
+        You are an expert MCQ generator. Create **5 high-quality multiple-choice questions (MCQs)** 
+        based on the given video transcript. 
+
+        - Each question should be **conceptual, not factual**.
+        - Provide **4 options** per question.
+        - Clearly indicate the **correct answer**.
+        - Explain why the correct answer is right.
+        - Keep questions **challenging yet understandable**.
+
+        Example format:
+        Q1: [Question]
+        A) Option 1
+        B) Option 2
+        C) Option 3
+        D) Option 4
+        Correct Answer: [Correct Option]
+        Explanation: [Why this is correct]
+
+        Transcript:
+        {transcript}
+        """
+
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+
+        # Extracting MCQs from response
+        mcqs = []
+        current_mcq = None
+        for line in response.text.split("\n"):
+            line = line.strip()
+            if line.startswith("Q"):
+                if current_mcq:
+                    mcqs.append(current_mcq)
+                current_mcq = {"question": line, "options": [], "correct_answer": "", "explanation": ""}
+            elif line.startswith(("A)", "B)", "C)", "D)")):
+                current_mcq["options"].append(line)
+            elif line.startswith("Correct Answer:"):
+                current_mcq["correct_answer"] = line.split(":")[1].strip()
+            elif line.startswith("Explanation:"):
+                current_mcq["explanation"] = line.split(":")[1].strip()
+
+        if current_mcq:
+            mcqs.append(current_mcq)
+
+        if len(mcqs) < 5:
+            raise HTTPException(status_code=500, detail="Not enough MCQs generated.")
+
+        return {"mcqs": mcqs}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
